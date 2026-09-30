@@ -47,6 +47,10 @@ Optional helper scripts in `tools/`:
 ## Screens
 ![Bambu Monitor](img/all.png)
 
+## Credits
+
+The Mini Turtle shown in the screenshots and preview is [Mini Turtle on MakerWorld](https://makerworld.com/en/models/2670421-mini-turtle#profileId-2955615).
+
 ## Licence
 
 [PolyForm Noncommercial 1.0.0](PolyForm%20NonCommercial%201.0.0.txt): free to use, modify and share for any non-commercial purpose. The Inter fonts in `tools/fonts` (and the `font_*.h` headers generated from them) are under the [SIL Open Font License](tools/fonts/Inter-LICENSE.txt).
