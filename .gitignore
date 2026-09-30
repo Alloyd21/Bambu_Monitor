@@ -1,0 +1,14 @@
+# Local credentials
+Bambu_Monitor_ESP32/credentials.h
+
+# Printer dump (contains serial number)
+tools/bambu_dump.json
+
+# Preview build output
+tools/preview/out/
+
+# Editor / tooling
+.claude/
+.vscode/
+__pycache__/
+*.pyc
