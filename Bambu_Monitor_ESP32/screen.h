@@ -19,6 +19,7 @@ bool drawThumbnailToFramebuffer();   // defined by the sketch
 
 struct PrinterStatus {
     String state = "CONNECTING";
+    int stage = -1;            // stg_cur: what the printer is doing within the job
     String printerName = "";   // e.g. "Bambu Lab X2D", from the printer's get_version reply
     String jobName = "";
     String taskId = "";
@@ -202,6 +203,7 @@ Rect_t padRect(Rect_t r, int pad) {
 
 const int NUMBER_FLASH_PAD = 12;
 const int NOZZLE_EXTRA_RIGHT = 16;   // on top of NUMBER_FLASH_PAD
+const int COLUMN_FLASH_GAP = 4;      // clear space kept before the next telemetry column
 
 Rect_t drawTextRight(const GFXfont* font, int32_t right, int32_t y, const String& text,
                      uint8_t fg = INK, int tracking = 0, uint8_t bg = PAPER) {
@@ -320,9 +322,42 @@ void addField(const String& sig, const Rect_t& r, int level = -1) {
 // Formatting
 // ------------------------------------------------------------
 
-String stateLabel(const String& state) {
-    if (state == "PRINTING")  return "PRINTING";
-    if (state == "PREPARING") return "PREPARING";
+// Label for the printer's current stage (stg_cur), or "" for none/unknown.
+String stageLabel(int stage) {
+    switch (stage) {
+        case 0:  return "PRINTING";
+        case 1:  return "BED LEVELING";
+        case 2:  return "PREHEATING BED";
+        case 3:  return "VIBRATION COMP";
+        case 4:  return "CHANGING FILAMENT";
+        case 5:  return "PAUSED";
+        case 6:  return "FILAMENT RUNOUT";
+        case 7:  return "HEATING HOTEND";
+        case 8:  return "CALIBRATING EXTRUSION";
+        case 9:  return "SCANNING BED";
+        case 10: return "INSPECTING 1ST LAYER";
+        case 11: return "IDENTIFYING PLATE";
+        case 12: return "CALIBRATING LIDAR";
+        case 13: return "HOMING";
+        case 14: return "CLEANING NOZZLE";
+        case 15: return "CHECKING TEMP";
+        case 16: return "PAUSED BY USER";
+        case 17: return "FRONT COVER FELL";
+        case 19: return "CALIBRATING FLOW";
+        case 22: return "UNLOADING FILAMENT";
+        case 24: return "LOADING FILAMENT";
+        case 25: return "CALIBRATING MOTOR";
+        case 29: return "COOLING CHAMBER";
+        default: return "";   // -1 / 255 idle, or a stage we don't know
+    }
+}
+
+// Pill text: the current stage while a job is active, else the state.
+String stateLabel(const String& state, int stage = -1) {
+    if (isActiveState(state)) {
+        String s = stageLabel(stage);
+        if (s.length()) return s;
+    }
     return state;
 }
 
@@ -374,7 +409,7 @@ int durationSpans(Span* out, int minutes) {
 // Wordmark on the left, state pill on the right, hairline below.
 // The wordmark is the printer's name once known ("Bambu Lab" in grey, the
 // model in ink), and "Bambu Monitor" until then.
-void drawHeader(const String& state, const String& printerName = "") {
+void drawHeader(const String& state, const String& printerName = "", int stage = -1) {
     String muted = "Bambu", ink = "Monitor";
     if (printerName.startsWith("Bambu Lab ")) {
         muted = "Bambu Lab";
@@ -392,7 +427,7 @@ void drawHeader(const String& state, const String& printerName = "") {
     Rect_t model = drawText(&InterBody, inkX, HEADER_BASE, ink, INK);
     addField("name" + printerName, muted.length() ? unionRect(brand, model) : model);
 
-    String label = stateLabel(state);
+    String label = stateLabel(state, stage);
     const int pillH = 38, padX = 20;
     int textW = textWidth(&InterLabel, label, LABEL_TRACKING);
     int pillW = textW + 2 * padX;
@@ -532,6 +567,9 @@ void drawTelemetry(const PrinterStatus& s) {
         Rect_t r = padRect(drawSpans(x, valueY, v, n), NUMBER_FLASH_PAD);
         // Three-digit nozzle temps still left stray pixels on the right edge.
         if (i == 2 || i == 3) r.width += NOZZLE_EXTRA_RIGHT;
+        // ...but never reach into the next column, or a refresh here wipes its text.
+        int nextX = LEFT_X + CONTENT_W * col / cols - COLUMN_FLASH_GAP;
+        if (col < cols && r.x + r.width > nextX) r.width = nextX - r.x;
         addField("t" + String(i) + sig, r);
     }
 }
@@ -545,7 +583,7 @@ int screenLayout(bool active, bool withThumb, bool hasJob, int telemetry) {
 // Draws the whole main screen into the (already white) framebuffer.
 void drawMainScreen(const PrinterStatus& s, bool withThumb, bool showRetryNote) {
     curFieldCount = 0;
-    drawHeader(s.state, s.printerName);
+    drawHeader(s.state, s.printerName, s.stage);
 
     int x0 = LEFT_X;
     if (withThumb) {

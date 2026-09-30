@@ -1202,6 +1202,7 @@ void parsePrinterStatus(const byte* payload, unsigned int length) {
     bool wasPrinting = isPrinting();
 
     if (!p["gcode_state"].isNull()) status.state = cleanState(p["gcode_state"].as<String>());
+    if (!p["stg_cur"].isNull()) status.stage = p["stg_cur"].as<int>();
     if (!p["subtask_name"].isNull()) status.jobName = p["subtask_name"].as<String>();
     if (!p["task_id"].isNull()) status.taskId = p["task_id"].as<String>();
     if (!p["gcode_file"].isNull()) status.gcodeFile = p["gcode_file"].as<String>();
@@ -1454,7 +1455,7 @@ void loop() {
 
         String sig =
             status.printerName + "|" +
-            status.state + "|" + status.jobName + "|" +
+            status.state + "|" + String(status.stage) + "|" + status.jobName + "|" +
             String(status.progress) + "|" +
             String(status.layer) + "|" +
             String(status.totalLayers) + "|" +
