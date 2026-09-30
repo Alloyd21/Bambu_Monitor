@@ -64,6 +64,7 @@ const uint16_t FTPS_PORT = 990;
 
 const unsigned long POLL_INTERVAL       = 10UL * 1000UL;   // check the printer for a new job
 const unsigned long MIN_REDRAW_INTERVAL = 60UL * 1000UL;   // regular screen updates; a new job bypasses this
+const unsigned long FINISHED_READY_MS   = 10UL * 60UL * 1000UL;   // "Print complete" turns into "Ready" after this
 
 // Preview area while printing
 const unsigned long THUMB_RETRY_MS         = 5UL * 1000UL;    // gap between failed preview fetches
@@ -207,6 +208,19 @@ String cleanState(String s) {
 
 bool isPrinting() {
     return isActiveState(status.state);
+}
+
+// The printer stays in FINISH until the next job, so the screen falls back to
+// "Ready" on its own a while after the print completed.
+unsigned long finishedAt = 0;        // when the state became FINISHED; 0 if it isn't
+bool finishedExpiryHandled = false;
+
+bool finishedExpired() {
+    return finishedAt && millis() - finishedAt >= FINISHED_READY_MS;
+}
+
+String displayState() {
+    return finishedExpired() ? String("IDLE") : status.state;
 }
 
 static uint16_t rd16(const uint8_t* p) {
@@ -1135,7 +1149,9 @@ void renderDisplay() {
     bool retrying = printing && !withThumb && thumbnailAttempts > 0;
     int layout = screenLayout(printing, withThumb, status.jobName.length() > 0, telemetryMask(status));
 
-    drawMainScreen(status, withThumb, retrying);
+    PrinterStatus shown = status;
+    shown.state = displayState();
+    drawMainScreen(shown, withThumb, retrying);
 
     bool full = layout != prevLayout ||
                 curFieldCount != prevFieldCount ||
@@ -1201,7 +1217,17 @@ void parsePrinterStatus(const byte* payload, unsigned int length) {
     String oldKey = status.taskId + "|" + status.jobName;
     bool wasPrinting = isPrinting();
 
-    if (!p["gcode_state"].isNull()) status.state = cleanState(p["gcode_state"].as<String>());
+    if (!p["gcode_state"].isNull()) {
+        status.state = cleanState(p["gcode_state"].as<String>());
+        if (status.state != "FINISHED") {
+            finishedAt = 0;
+            finishedExpiryHandled = false;
+        } else if (!finishedAt) {
+            // Already finished when we first hear from the printer (monitor just
+            // restarted): we don't know when, so show "Ready" straight away.
+            finishedAt = firstFullStatusReceived ? millis() : millis() - FINISHED_READY_MS;
+        }
+    }
     if (!p["stg_cur"].isNull()) status.stage = p["stg_cur"].as<int>();
     if (!p["subtask_name"].isNull()) status.jobName = p["subtask_name"].as<String>();
     if (!p["task_id"].isNull()) status.taskId = p["task_id"].as<String>();
@@ -1447,6 +1473,12 @@ void loop() {
 
     static String lastSignature = "";
 
+    // Time alone moves FINISHED to "Ready"; no status message triggers that redraw.
+    if (finishedExpired() && !finishedExpiryHandled) {
+        finishedExpiryHandled = true;
+        screenDirty = true;
+    }
+
     // Draw before doing any FTPS work: the thumbnail search can take a while and
     // must not hold the boot screen up.
     if (screenDirty &&
@@ -1455,7 +1487,7 @@ void loop() {
 
         String sig =
             status.printerName + "|" +
-            status.state + "|" + String(status.stage) + "|" + status.jobName + "|" +
+            displayState() + "|" + String(status.stage) + "|" + status.jobName + "|" +
             String(status.progress) + "|" +
             String(status.layer) + "|" +
             String(status.totalLayers) + "|" +
