@@ -10,6 +10,10 @@ An e-paper status display for Bambu Lab printers. Shows print progress, temperat
 
 A microSD card is optional. If one is inserted, the display writes a log to `log.txt` and caches the current plate preview so it reappears straight away after a restart.
 
+### 3D printed case (optional)
+
+[Case for LILYGO T5 4.7 inch e-paper V2.3 ESP32-S3](https://www.printables.com/model/960032-case-for-lilygo-t5-47-inch-e-paper-v23-esp32-s3) on Printables.
+
 ## Supported printers
 
 Tested on the Bambu Lab X2D. Other Bambu printers with LAN mode should work too; readings a printer doesn't have (a second nozzle, chamber sensor or AMS) are simply left off the screen.
