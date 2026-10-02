@@ -63,7 +63,7 @@ const uint16_t MQTT_PORT = 8883;
 const uint16_t FTPS_PORT = 990;
 
 const unsigned long POLL_INTERVAL       = 10UL * 1000UL;   // check the printer for a new job
-const unsigned long MIN_REDRAW_INTERVAL = 60UL * 1000UL;   // regular screen updates; a new job bypasses this
+const unsigned long MIN_REDRAW_INTERVAL = 10UL * 1000UL;   // at most one redraw per interval, only when shown data changed; a new job bypasses this
 const unsigned long FINISHED_READY_MS   = 10UL * 60UL * 1000UL;   // "Print complete" turns into "Ready" after this
 
 // Preview area while printing
@@ -1134,7 +1134,10 @@ void pushRegion(Rect_t r, bool flash, bool inkOnly = false) {
         }
     }
 
-    if (flash) epd_clear_area_cycles(area, 2, 50);
+    // Same strength as the library's own epd_clear_area: with only 2 cycles a
+    // field that changes every update (an idle nozzle's temp) fades a little
+    // each time until the next full refresh.
+    if (flash) epd_clear_area_cycles(area, 4, 50);
     epd_draw_grayscale_image(area, buf);
     free(buf);
 }
@@ -1147,7 +1150,8 @@ void renderDisplay() {
     // The preview stays up after the print ends, as long as it belongs to the last job.
     bool withThumb = thumbnailReady && thumbnailKey == status.taskId + "|" + status.jobName;
     bool retrying = printing && !withThumb && thumbnailAttempts > 0;
-    int layout = screenLayout(printing, withThumb, status.jobName.length() > 0, telemetryMask(status));
+    int layout = screenLayout(printing, withThumb, status.jobName.length() > 0, telemetryMask(status),
+                              status.filamentCount > 0);
 
     PrinterStatus shown = status;
     shown.state = displayState();

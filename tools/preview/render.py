@@ -95,7 +95,8 @@ def main():
     subprocess.check_call([exe], cwd=HERE)
 
     pngs = []
-    for pgm in sorted(glob.glob(os.path.join(OUT, "*.pgm"))):
+    for pgm in sorted(glob.glob(os.path.join(OUT, "*.pgm")),
+                      key=lambda p: int(re.match(r"\d+", os.path.basename(p)).group())):
         a = np.asarray(Image.open(pgm).convert("L"), np.float32) / 255.0   # 0 black .. 1 white
         rgb = INK + a[..., None] * (PAPER - INK)
         png = pgm[:-4] + ".png"

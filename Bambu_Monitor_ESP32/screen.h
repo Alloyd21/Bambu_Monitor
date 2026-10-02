@@ -17,6 +17,15 @@
 extern uint8_t* framebuffer;
 bool drawThumbnailToFramebuffer();   // defined by the sketch
 
+// One filament the sliced plate uses, from Metadata/slice_info.config in the .3mf.
+const int MAX_FILAMENTS = 8;
+struct Filament {
+    String type;              // "PLA", "PETG-CF", ...
+    uint32_t color = 0x808080; // 0xRRGGBB as sliced
+    float grams = NAN;
+    float meters = NAN;
+};
+
 struct PrinterStatus {
     String state = "CONNECTING";
     int stage = -1;            // stg_cur: what the printer is doing within the job
@@ -29,6 +38,9 @@ struct PrinterStatus {
     int layer = -1;
     int totalLayers = -1;
     int remainingMinutes = -1;
+
+    Filament filaments[MAX_FILAMENTS];
+    int filamentCount = 0;
 
     float chamberTemp = NAN;
     float bedTemp = NAN;
@@ -284,6 +296,29 @@ void hairline(int32_t y) {
     epd_draw_hline(LEFT_X, y, CONTENT_W, RULE, framebuffer);
 }
 
+// Filament colour swatches: dots of the colour's lightness, since the panel
+// only has greys. Several in a row overlap like a stack of chips.
+const int SWATCH_R = 9;
+const int SWATCH_STEP = 14;   // centre to centre in a stack
+
+int swatchesWidth(int n) {
+    return n > 0 ? (n - 1) * SWATCH_STEP + 2 * SWATCH_R + 1 : 0;
+}
+
+uint8_t swatchGrey(uint32_t rgb) {
+    int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+    return (uint8_t)((r * 54 + g * 183 + b * 19) >> 8);   // Rec. 709 luma
+}
+
+// A paper ring keeps overlapping dots apart; light colours get a grey rim so
+// white filament still shows against the paper.
+void drawSwatch(int32_t cx, int32_t cy, uint32_t rgb) {
+    uint8_t grey = swatchGrey(rgb);
+    epd_fill_circle(cx, cy, SWATCH_R + 2, 0xFF, framebuffer);
+    epd_fill_circle(cx, cy, SWATCH_R, min(grey, (uint8_t)0x90), framebuffer);
+    epd_fill_circle(cx, cy, SWATCH_R - 2, grey, framebuffer);
+}
+
 // ------------------------------------------------------------
 // Partial refresh bookkeeping
 //
@@ -361,6 +396,23 @@ String stateLabel(const String& state, int stage = -1) {
     return state;
 }
 
+// Width of the widest label the pill can show (every stage and state), so the
+// pill's refresh area always covers a longer pill that came before it.
+int widestStateLabelW() {
+    static int widest = 0;
+    if (widest) return widest;
+    static const char* const states[] = {
+        "PRINTING", "PAUSED", "FINISHED", "PREPARING", "FAILED", "IDLE", "CONNECTING"
+    };
+    for (const char* s : states)
+        widest = max(widest, textWidth(&InterLabel, s, LABEL_TRACKING));
+    for (int stage = 0; stage < 256; stage++) {
+        String s = stageLabel(stage);
+        if (s.length()) widest = max(widest, textWidth(&InterLabel, s, LABEL_TRACKING));
+    }
+    return widest;
+}
+
 String idleHeadline(const String& state) {
     if (state == "FINISHED")   return "Print complete";
     if (state == "FAILED")     return "Print failed";
@@ -402,6 +454,69 @@ int durationSpans(Span* out, int minutes) {
     return n;
 }
 
+// Filament for the whole plate in grams or metres; NAN if the slicer gave none.
+float filamentTotal(const PrinterStatus& s, bool meters) {
+    float total = 0;
+    bool any = false;
+    for (int i = 0; i < s.filamentCount; i++) {
+        float v = meters ? s.filaments[i].meters : s.filaments[i].grams;
+        if (!isnan(v)) { total += v; any = true; }
+    }
+    return any ? total : NAN;
+}
+
+// 48g / 1.21kg or 16.1m / 123m, set like durationSpans: number in ink, unit grey.
+int amountSpans(Span* out, float value, bool meters, const GFXfont* numFont, const GFXfont* unitFont) {
+    String num, unit;
+    if (meters) {
+        num = value < 100 ? String(value, 1) : String((int)lroundf(value));
+        unit = "m";
+    } else if (value < 1000) {
+        num = String((int)lroundf(value));
+        unit = "g";
+    } else {
+        num = String(value / 1000, 2);
+        unit = "kg";
+    }
+    out[0] = {numFont, num, INK};
+    out[1] = {unitFont, unit, MUTED};
+    return 2;
+}
+
+// The plate's filaments grouped by type, keeping slicer order, so four colours
+// of PLA read as one material with four swatches.
+struct MaterialGroup {
+    String type;
+    uint32_t colors[MAX_FILAMENTS];
+    int count = 0;
+};
+
+int materialGroups(const PrinterStatus& s, MaterialGroup* out) {
+    int n = 0;
+    for (int i = 0; i < s.filamentCount; i++) {
+        String type = s.filaments[i].type;
+        type.toUpperCase();
+        if (!type.length()) type = "?";
+        int g = 0;
+        while (g < n && out[g].type != type) g++;
+        if (g == n) { out[n].type = type; out[n].count = 0; n++; }
+        out[g].colors[out[g].count++] = s.filaments[i].color;
+    }
+    return n;
+}
+
+// Changes whenever anything the materials row shows changes.
+String materialsSig(const PrinterStatus& s) {
+    String sig;
+    for (int i = 0; i < s.filamentCount; i++) {
+        const Filament& f = s.filaments[i];
+        sig += f.type + "," + String((unsigned long)f.color) + "," +
+               String((int)lroundf(isnan(f.grams) ? -1 : f.grams * 10)) + "," +
+               String((int)lroundf(isnan(f.meters) ? -1 : f.meters * 10)) + ";";
+    }
+    return sig;
+}
+
 // ------------------------------------------------------------
 // Screen sections
 // ------------------------------------------------------------
@@ -436,9 +551,12 @@ void drawHeader(const String& state, const String& printerName = "", int stage =
     fillPill(pillX, pillY, pillW, pillH, 0);
     drawLabel(pillX + padX, pillY + pillH / 2 + 7, label, PAPER, INK);
 
+    // Refresh area spans the widest possible pill (plus margin), not just this
+    // one, so a shorter label fully clears a longer one drawn before it.
+    int areaW = max(textW, widestStateLabelW()) + 2 * padX + 24;
     Rect_t r;
-    r.x = pillX - 4;  r.y = pillY - 4;
-    r.width = pillW + 8;  r.height = pillH + 8;
+    r.x = RIGHT_X - areaW - 4;  r.y = pillY - 4;
+    r.width = areaW + 8;  r.height = pillH + 8;
     addField("state" + label, r);
 
     hairline(HEADER_RULE);
@@ -453,15 +571,113 @@ void fieldBar(int x, int y, int w, int h, int progress) {
     addField("bar" + String(progress), r, max(progress, 0));
 }
 
+// What a materials row shows. Rows that must fit a width try MAT_FIT_ORDER
+// from the most detailed down: the length goes first (weight is what spools
+// are reckoned in), then the type names; the swatches and weight stay.
+const int MAT_SWATCHES = 1;
+const int MAT_TYPES    = 2;   // the type after each group's swatches
+const int MAT_WEIGHT   = 4;   // the plate's total weight
+const int MAT_LENGTH   = 8;   // ...and length
+const int MAT_FIT_ORDER[] = {
+    MAT_SWATCHES | MAT_TYPES | MAT_WEIGHT | MAT_LENGTH,
+    MAT_SWATCHES | MAT_TYPES | MAT_WEIGHT,
+    MAT_SWATCHES | MAT_WEIGHT,
+    MAT_WEIGHT,
+};
+const int MAT_FIT_STEPS = sizeof(MAT_FIT_ORDER) / sizeof(MAT_FIT_ORDER[0]);
+
+// One line about the plate's filament, with its baseline at y:
+//   [swatches] PLA  [swatch] PETG   48g · 16.1m
+// Types are small caps in ink, so they read as values beside grey labels.
+// With draw false it only measures. Returns the width.
+int materialsRow(const PrinterStatus& s, int show, int x, int y, bool draw, Rect_t* area = nullptr) {
+    const GFXfont* typeFont = &InterLabel;
+    const int typeTracking = LABEL_TRACKING;
+    const int lift = 9;   // swatch centre, level with the middle of the numbers
+    Rect_t r = emptyRect();
+    int pen = x;
+    bool any = false;
+
+    auto swatches = [&](const uint32_t* colors, int n) {
+        if (draw) {
+            for (int i = 0; i < n; i++) drawSwatch(pen + SWATCH_R + i * SWATCH_STEP, y - lift, colors[i]);
+            Rect_t sr;
+            sr.x = pen - TEXT_PAD;  sr.y = y - lift - SWATCH_R - 2 - TEXT_PAD;
+            sr.width = swatchesWidth(n) + 2 * TEXT_PAD;  sr.height = 2 * SWATCH_R + 5 + 2 * TEXT_PAD;
+            r = unionRect(r, sr);
+        }
+        pen += swatchesWidth(n);
+    };
+
+    MaterialGroup groups[MAX_FILAMENTS];
+    int ng = materialGroups(s, groups);
+    if ((show & MAT_SWATCHES) && (show & MAT_TYPES)) {
+        for (int g = 0; g < ng; g++) {
+            if (g) pen += 20;
+            swatches(groups[g].colors, groups[g].count);
+            pen += 7;
+            if (draw) r = unionRect(r, drawText(typeFont, pen, y, groups[g].type, INK, typeTracking));
+            pen += textWidth(typeFont, groups[g].type, typeTracking);
+        }
+        any = ng > 0;
+    } else if (show & MAT_SWATCHES) {
+        uint32_t all[MAX_FILAMENTS];
+        for (int i = 0; i < s.filamentCount; i++) all[i] = s.filaments[i].color;
+        swatches(all, s.filamentCount);
+        any = s.filamentCount > 0;
+    }
+
+    float grams = show & MAT_WEIGHT ? filamentTotal(s, false) : NAN;
+    float meters = show & MAT_LENGTH ? filamentTotal(s, true) : NAN;
+    Span v[2];
+    if (!isnan(grams)) {
+        if (any) pen += 22;
+        int n = amountSpans(v, grams, false, &InterBody, &InterBody);
+        if (draw) r = unionRect(r, drawSpans(pen, y, v, n));
+        pen += spansWidth(v, n);
+    }
+    if (!isnan(meters)) {
+        if (!isnan(grams)) {
+            // Middle dot; the fonts don't carry one.
+            if (draw) epd_fill_circle(pen + 11, y - 9, 2, 0x80, framebuffer);
+            pen += 24;
+        } else if (any) {
+            pen += 22;
+        }
+        int n = amountSpans(v, meters, true, &InterBody, &InterBody);
+        if (draw) r = unionRect(r, drawSpans(pen, y, v, n));
+        pen += spansWidth(v, n);
+    }
+
+    if (area) *area = r;
+    return pen - x;
+}
+
+// The most detailed materials row that fits maxWidth, or 0 if none does.
+int fitMaterials(const PrinterStatus& s, int maxWidth) {
+    for (int i = 0; i < MAT_FIT_STEPS; i++)
+        if (materialsRow(s, MAT_FIT_ORDER[i], 0, 0, false) <= maxWidth) return MAT_FIT_ORDER[i];
+    return 0;
+}
+
 // Job name, big percentage, time remaining, progress bar and layer count,
 // laid out between x0 and RIGHT_X.
 void drawProgress(const PrinterStatus& s, int x0, bool showRetryNote) {
     const int nameY = 136, numberY = 290, barY = 314, barH = 12, footY = 366;
 
+    // The note about the missing preview sits at the top, beside the name, so
+    // the footer means the same thing with or without a preview.
+    const char* note = "PREVIEW UNAVAILABLE, RETRYING";
+    int nameW = RIGHT_X - x0;
+    if (showRetryNote) nameW -= textWidth(&InterLabel, note, LABEL_TRACKING) + 40;
     addField("job" + s.jobName,
-             drawText(&InterBody, x0, nameY, fitText(&InterBody, s.jobName, RIGHT_X - x0)));
+             drawText(&InterBody, x0, nameY, fitText(&InterBody, s.jobName, nameW)));
+    if (showRetryNote)
+        addField("note", drawLabelRight(RIGHT_X, nameY, note));
+    else
+        addField("", emptyRect());
 
-    // 67% : numerals in the display face, the percent sign small and grey.
+    // 67%: numerals in the display face, the percent sign small and grey.
     String pct = s.progress >= 0 ? String(s.progress) : "--";
     Rect_t a = drawText(&InterNumeral, x0 - 4, numberY, pct, s.progress >= 0 ? INK : MUTED);
     Rect_t b = drawText(&InterTitle, a.x + a.width - TEXT_PAD + 6, numberY, "%", MUTED);
@@ -485,14 +701,46 @@ void drawProgress(const PrinterStatus& s, int x0, bool showRetryNote) {
         addField("layer--", drawText(&InterBody, vx, footY, "--", MUTED));
     }
 
-    if (showRetryNote)
-        addField("note", drawLabelRight(RIGHT_X, footY, "PREVIEW UNAVAILABLE, RETRYING"));
-    else
+    // The plate's filament fills the rest of the footer, right-aligned under the
+    // time remaining. How much detail fits is judged against the widest the
+    // layer count gets this print, so the row doesn't change shape mid-print.
+    String widestLayer = s.totalLayers > 0 ? String(s.totalLayers) + " / " + String(s.totalLayers) : "--";
+    int room = RIGHT_X - (vx + textWidth(&InterBody, widestLayer)) - 32;
+    int show = fitMaterials(s, room);
+    if (show) {
+        Rect_t r;
+        int w = materialsRow(s, show, 0, footY, false);
+        materialsRow(s, show, RIGHT_X - w, footY, true, &r);
+        addField("mat" + String(show) + materialsSig(s), r);
+    } else {
         addField("", emptyRect());
+    }
+}
+
+// Not printing, with the last job's filament known: the headline, then two
+// label-over-value pairs, the job and its filament. The filament line is the
+// one from the printing footer, here with room for its full detail.
+void drawJobSummary(const PrinterStatus& s, int x0) {
+    const int headY = 152, jobLabelY = 204, jobY = 248, matLabelY = 298, matY = 342;
+
+    addField("head" + s.state, drawText(&InterTitle, x0, headY, idleHeadline(s.state)));
+    drawLabel(x0, jobLabelY, "LAST PRINT");
+    addField("job" + s.jobName,
+             drawText(&InterBody, x0, jobY, fitText(&InterBody, s.jobName, RIGHT_X - x0)));
+
+    drawLabel(x0, matLabelY, "FILAMENT");
+    int show = fitMaterials(s, RIGHT_X - x0);
+    Rect_t r = emptyRect();
+    if (show) materialsRow(s, show, x0, matY, true, &r);
+    addField("mat" + String(show) + materialsSig(s), r);
 }
 
 // Not printing: a headline for the state, then the last job if there is one.
 void drawIdle(const PrinterStatus& s, int x0) {
+    if (s.jobName.length() && s.filamentCount > 0) {
+        drawJobSummary(s, x0);
+        return;
+    }
     bool hasJob = s.jobName.length() > 0;
     int headY = hasJob ? 190 : 226;
 
@@ -575,9 +823,11 @@ void drawTelemetry(const PrinterStatus& s) {
 }
 
 // Layout id: a change of layout forces a full refresh. It includes which
-// readings are shown, since hiding one moves the labels of the others.
-int screenLayout(bool active, bool withThumb, bool hasJob, int telemetry) {
-    return (active ? 1 : 0) | (withThumb ? 2 : 0) | (hasJob ? 4 : 0) | (telemetry << 3);
+// readings are shown, since hiding one moves the labels of the others, and
+// whether the filament is known, which rearranges the finished screen.
+int screenLayout(bool active, bool withThumb, bool hasJob, int telemetry, bool hasFilament = false) {
+    return (active ? 1 : 0) | (withThumb ? 2 : 0) | (hasJob ? 4 : 0) | (hasFilament ? 8 : 0) |
+           (telemetry << 4);
 }
 
 // Draws the whole main screen into the (already white) framebuffer.

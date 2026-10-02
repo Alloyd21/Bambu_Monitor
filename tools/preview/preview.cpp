@@ -46,6 +46,10 @@ static PrinterStatus printing() {
     s.rightNozzleTemp = 38.0f;
     s.amsTemp = 28.4f;
     s.amsHumidityRaw = 18;
+    s.filamentCount = 3;
+    s.filaments[0] = {"PLA", 0x00AE42, 32.4f, 10.9f};
+    s.filaments[1] = {"PLA", 0x161616, 9.8f, 3.3f};
+    s.filaments[2] = {"PLA", 0xFFFFFF, 5.6f, 1.9f};
     return s;
 }
 
@@ -86,7 +90,28 @@ int main() {
     one.printerName = "Bambu Lab P1S";
     one.chamberTemp = NAN; one.leftNozzleTemp = NAN; one.rightNozzleTemp = 218.6f;
     one.amsTemp = NAN; one.amsHumidityRaw = -1;
+    one.filamentCount = 1;
+    one.filaments[0] = {"PETG", 0x2850E0, 112.3f, 37.4f};
     clear(); drawMainScreen(one, true, false); save("8_single_nozzle");
+
+    // Busy multi-material plate: the footer drops the type names to fit.
+    PrinterStatus mm = printing();
+    mm.jobName = "Mini Turtle";
+    mm.progress = 23; mm.layer = 61; mm.totalLayers = 1240; mm.remainingMinutes = 615;
+    mm.filamentCount = 5;
+    mm.filaments[0] = {"PLA", 0xC12E1F, 182.0f, 60.1f};
+    mm.filaments[1] = {"PLA", 0xF4EE2A, 64.5f, 21.3f};
+    mm.filaments[2] = {"PETG", 0x161616, 410.2f, 135.6f};
+    mm.filaments[3] = {"TPU", 0x8E9089, 22.9f, 8.0f};
+    mm.filaments[4] = {"PLA-CF", 0x2C2C2C, 590.0f, 196.4f};
+    clear(); drawMainScreen(mm, true, false); save("9_multi_material");
+    mm.state = "FINISHED"; mm.progress = 100; mm.remainingMinutes = 0;
+    clear(); drawMainScreen(mm, true, false); save("10_finished_multi_material");
+
+    // Finished, but the slicer data couldn't be read: the screen falls back.
+    PrinterStatus nd = d;
+    nd.filamentCount = 0;
+    clear(); drawMainScreen(nd, true, false); save("11_finished_no_filament_data");
 
     clear();
     drawHeader("CONNECTING");
