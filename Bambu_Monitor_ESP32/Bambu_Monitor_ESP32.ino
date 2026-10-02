@@ -106,6 +106,10 @@ bool thumbnailAttempted = false;
 int thumbnailAttempts = 0;
 unsigned long thumbnailRetryAt = 0;
 
+// status.filaments comes from the same .3mf as the thumbnail and belongs to
+// this job ("taskId|jobName"); it is only shown while that job is current.
+String filamentKey = "";
+
 // ============================================================
 // LOGGING: mirrors everything to Serial and to /log.txt on the SD card
 // ============================================================
@@ -139,17 +143,26 @@ public:
 
 TeeLog Log;
 
-// Cache the current job's thumbnail (/thumb.png) and the job it belongs to
-// (/thumb.key), so a restart mid-print reuses it instead of downloading again.
-void saveThumbnailToSD(const uint8_t* data, size_t size, const String& key) {
+// Cache the current job's thumbnail (/thumb.png), its slice_info.config
+// (/slice.xml, empty if the archive had none) and the job they belong to
+// (/thumb.key), so a restart mid-print reuses them instead of downloading again.
+void saveThumbnailToSD(const uint8_t* data, size_t size, const String& sliceXml, const String& key) {
     if (!Log.sdOk) return;
-    SD.remove("/thumb.key");   // invalid until the PNG is fully written
+    SD.remove("/thumb.key");   // invalid until both files are fully written
     File f = SD.open("/thumb.png", FILE_WRITE);
     if (!f) return;
     size_t written = f.write(data, size);
     f.close();
     if (written != size) {
         Log.println("SD: thumbnail write incomplete");
+        return;
+    }
+    File x = SD.open("/slice.xml", FILE_WRITE);
+    if (!x) return;
+    written = x.print(sliceXml);
+    x.close();
+    if (written != sliceXml.length()) {
+        Log.println("SD: slice info write incomplete");
         return;
     }
     File k = SD.open("/thumb.key", FILE_WRITE);
@@ -159,15 +172,23 @@ void saveThumbnailToSD(const uint8_t* data, size_t size, const String& key) {
     Log.printf("Saved /thumb.png (%u bytes) for %s\n", (unsigned)size, key.c_str());
 }
 
-// Loads the cached thumbnail into PSRAM if it belongs to `key`.
-bool loadThumbnailFromSD(const String& key, uint8_t*& out, size_t& outSize) {
-    if (!Log.sdOk || !SD.exists("/thumb.key") || !SD.exists("/thumb.png")) return false;
+// Loads the cached thumbnail into PSRAM, and its slice info, if they belong to
+// `key`. A cache from before slice info was kept has no /slice.xml and is
+// treated as a miss, so the archive is read again.
+bool loadThumbnailFromSD(const String& key, uint8_t*& out, size_t& outSize, String& sliceXml) {
+    if (!Log.sdOk || !SD.exists("/thumb.key") || !SD.exists("/thumb.png") || !SD.exists("/slice.xml"))
+        return false;
 
     File k = SD.open("/thumb.key", FILE_READ);
     if (!k) return false;
     String saved = k.readString();
     k.close();
     if (saved != key) return false;
+
+    File x = SD.open("/slice.xml", FILE_READ);
+    if (!x) return false;
+    sliceXml = x.readString();
+    x.close();
 
     File f = SD.open("/thumb.png", FILE_READ);
     if (!f) return false;
@@ -550,7 +571,32 @@ bool ftpReadRange(FtpSession& s, const String& path, uint32_t offset, uint8_t* o
 // We only fetch the central directory + selected PNG bytes.
 // ============================================================
 
-bool findZipThumbnail(FtpSession& s, const String& remotePath, ZipEntryInfo& found) {
+// Finds the member called `wanted` in a ZIP central directory.
+bool findZipEntry(const uint8_t* cd, uint32_t cdSize, const String& wanted, ZipEntryInfo& found) {
+    size_t pos = 0;
+    while (pos + 46 <= cdSize) {
+        if (rd32(cd + pos) != 0x02014b50UL) break;
+        uint16_t nameLen  = rd16(cd + pos + 28);
+        uint16_t extraLen = rd16(cd + pos + 30);
+        uint16_t commLen  = rd16(cd + pos + 32);
+        if (pos + 46 + nameLen > cdSize) break;
+
+        if (nameLen == wanted.length() && memcmp(cd + pos + 46, wanted.c_str(), nameLen) == 0) {
+            found.method = rd16(cd + pos + 10);
+            found.compressedSize = rd32(cd + pos + 20);
+            found.uncompressedSize = rd32(cd + pos + 24);
+            found.localHeaderOffset = rd32(cd + pos + 42);
+            found.name = wanted;
+            return true;
+        }
+        pos += 46 + nameLen + extraLen + commLen;
+    }
+    return false;
+}
+
+// Finds the plate's preview PNG in the .3mf, and its Metadata/slice_info.config
+// (filament per plate) when the archive has one; sliceInfo.name stays empty if not.
+bool findZipThumbnail(FtpSession& s, const String& remotePath, ZipEntryInfo& found, ZipEntryInfo& sliceInfo) {
     uint32_t fileSize = 0;
     if (!ftpSize(s, remotePath, fileSize)) return false;
 
@@ -604,39 +650,107 @@ bool findZipThumbnail(FtpSession& s, const String& remotePath, ZipEntryInfo& fou
     };
 
     bool ok = false;
-    for (const String& wanted : preferred) {
-        size_t pos = 0;
-        while (pos + 46 <= cdSize) {
-            if (rd32(cd + pos) != 0x02014b50UL) break;
-            uint16_t method   = rd16(cd + pos + 10);
-            uint32_t compSize = rd32(cd + pos + 20);
-            uint32_t rawSize  = rd32(cd + pos + 24);
-            uint16_t nameLen  = rd16(cd + pos + 28);
-            uint16_t extraLen = rd16(cd + pos + 30);
-            uint16_t commLen  = rd16(cd + pos + 32);
-            uint32_t localOfs = rd32(cd + pos + 42);
+    for (const String& wanted : preferred)
+        if ((ok = findZipEntry(cd, cdSize, wanted, found))) break;
 
-            if (pos + 46 + nameLen > cdSize) break;
-            String name;
-            name.reserve(nameLen);
-            for (uint16_t i = 0; i < nameLen; i++) name += (char)cd[pos + 46 + i];
-
-            if (name == wanted) {
-                found.localHeaderOffset = localOfs;
-                found.compressedSize = compSize;
-                found.uncompressedSize = rawSize;
-                found.method = method;
-                found.name = name;
-                ok = true;
-                break;
-            }
-            pos += 46 + nameLen + extraLen + commLen;
-        }
-        if (ok) break;
-    }
+    if (!findZipEntry(cd, cdSize, "Metadata/slice_info.config", sliceInfo)) sliceInfo.name = "";
 
     free(cd);
     return ok;
+}
+
+// ============================================================
+// SLICE INFO
+// Metadata/slice_info.config lists, per plate, each filament the slicer
+// used: <filament id="1" type="PLA" color="#057748" used_m="7.31" used_g="21.81" .../>
+// ============================================================
+
+// The value of attribute `name` in the tag text `tag`, or "".
+String xmlAttr(const String& tag, const char* name) {
+    String key = String(" ") + name + "=\"";
+    int a = tag.indexOf(key);
+    if (a < 0) return "";
+    a += key.length();
+    int b = tag.indexOf('"', a);
+    return b < 0 ? String("") : tag.substring(a, b);
+}
+
+// The plate number being printed, from gcode_file, e.g. "/data/Metadata/plate_3.gcode" -> 3.
+int currentPlateIndex() {
+    int ps = status.gcodeFile.lastIndexOf("plate_");
+    int n = ps >= 0 ? status.gcodeFile.substring(ps + 6).toInt() : 0;
+    return n > 0 ? n : 1;
+}
+
+// Fills status.filaments from slice_info.config for the plate being printed
+// (or the first plate listed, if none matches) and marks them as `key`'s.
+void applySliceInfo(const String& xml, const String& key) {
+    status.filamentCount = 0;
+    filamentKey = key;
+
+    // Pick the <plate> block.
+    int plateIndex = currentPlateIndex();
+    int start = -1, end = -1, pos = 0;
+    while (true) {
+        int a = xml.indexOf("<plate>", pos);
+        if (a < 0) break;
+        int b = xml.indexOf("</plate>", a);
+        if (b < 0) b = xml.length();
+        int i = xml.indexOf("key=\"index\" value=\"", a);
+        int index = i >= 0 && i < b ? xml.substring(i + 19).toInt() : 0;
+        if (start < 0 || index == plateIndex) {
+            start = a;
+            end = b;
+            if (index == plateIndex) break;
+        }
+        pos = b;
+    }
+    if (start < 0) {
+        Log.println("Slice info: no plate listed");
+        return;
+    }
+
+    pos = start;
+    while (status.filamentCount < MAX_FILAMENTS) {
+        int a = xml.indexOf("<filament ", pos);
+        if (a < 0 || a > end) break;
+        int b = xml.indexOf('>', a);
+        if (b < 0) break;
+        pos = b;
+        String tag = xml.substring(a, b);
+
+        Filament f;
+        f.type = xmlAttr(tag, "type");
+        String color = xmlAttr(tag, "color");   // "#RRGGBB" or "#RRGGBBAA"
+        if (color.startsWith("#") && color.length() >= 7)
+            f.color = strtoul(color.substring(1, 7).c_str(), nullptr, 16);
+        String g = xmlAttr(tag, "used_g"), m = xmlAttr(tag, "used_m");
+        if (g.length()) f.grams = g.toFloat();
+        if (m.length()) f.meters = m.toFloat();
+        if (f.grams == 0) continue;   // listed for the project but unused on this plate
+
+        status.filaments[status.filamentCount++] = f;
+    }
+    Log.printf("Slice info: plate %d, %d filament(s), %.1f g\n",
+               plateIndex, status.filamentCount, filamentTotal(status, false));
+}
+
+// Reads and inflates slice_info.config from the archive; "" if it can't.
+String fetchSliceInfo(FtpSession& s, const String& remotePath, const ZipEntryInfo& e) {
+    if (!e.name.length() || e.uncompressedSize > 64UL * 1024UL) return "";
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!fetchZipMember(s, remotePath, e, data, size)) return "";
+    char* text = (char*)ps_malloc(size + 1);
+    String xml;
+    if (text) {
+        memcpy(text, data, size);
+        text[size] = 0;
+        xml = text;
+        free(text);
+    }
+    free(data);
+    return xml;
 }
 
 bool fetchZipMember(FtpSession& s, const String& remotePath, const ZipEntryInfo& e,
@@ -791,12 +905,14 @@ bool fetchCurrentJobThumbnail() {
     // Same job as the cached image (e.g. after a restart): skip the download.
     uint8_t* cached = nullptr;
     size_t cachedSize = 0;
-    if (loadThumbnailFromSD(key, cached, cachedSize)) {
+    String cachedXml;
+    if (loadThumbnailFromSD(key, cached, cachedSize, cachedXml)) {
         thumbnailPng = cached;
         thumbnailPngSize = cachedSize;
         thumbnailReady = true;
         thumbnailKey = key;
         Log.printf("Thumbnail loaded from SD cache: %u bytes\n", (unsigned)cachedSize);
+        applySliceInfo(cachedXml, key);
         return true;
     }
 
@@ -841,8 +957,8 @@ bool fetchCurrentJobThumbnail() {
         // candidate would only open more connections.
         if (ftpRefused) break;
         Log.println("Thumbnail: trying " + candidates[i]);
-        ZipEntryInfo entry;
-        if (!findZipThumbnail(ftp, candidates[i], entry)) continue;
+        ZipEntryInfo entry, sliceEntry;
+        if (!findZipThumbnail(ftp, candidates[i], entry, sliceEntry)) continue;
 
         Log.printf("Thumbnail member: %s (%lu bytes, method %u)\n",
                       entry.name.c_str(), (unsigned long)entry.uncompressedSize, entry.method);
@@ -850,6 +966,10 @@ bool fetchCurrentJobThumbnail() {
         uint8_t* png = nullptr;
         size_t pngSize = 0;
         if (fetchZipMember(ftp, candidates[i], entry, png, pngSize)) {
+            // Same archive, same session: the filament for this plate.
+            String sliceXml = fetchSliceInfo(ftp, candidates[i], sliceEntry);
+            if (!sliceXml.length()) Log.println("Slice info: not in this archive");
+
             // MQTT was serviced during the download; drop the result if the job changed.
             if (key != status.taskId + "|" + status.jobName) {
                 free(png);
@@ -862,7 +982,8 @@ bool fetchCurrentJobThumbnail() {
             thumbnailReady = true;
             thumbnailKey = key;
             Log.printf("Thumbnail ready: %u bytes\n", (unsigned)thumbnailPngSize);
-            saveThumbnailToSD(thumbnailPng, thumbnailPngSize, key);
+            applySliceInfo(sliceXml, key);
+            saveThumbnailToSD(thumbnailPng, thumbnailPngSize, sliceXml, key);
             return true;
         }
     }
@@ -1150,11 +1271,14 @@ void renderDisplay() {
     // The preview stays up after the print ends, as long as it belongs to the last job.
     bool withThumb = thumbnailReady && thumbnailKey == status.taskId + "|" + status.jobName;
     bool retrying = printing && !withThumb && thumbnailAttempts > 0;
-    int layout = screenLayout(printing, withThumb, status.jobName.length() > 0, telemetryMask(status),
-                              status.filamentCount > 0);
 
     PrinterStatus shown = status;
     shown.state = displayState();
+    // Filament read for an earlier job is not shown against a new one.
+    if (filamentKey != status.taskId + "|" + status.jobName) shown.filamentCount = 0;
+
+    int layout = screenLayout(printing, withThumb, status.jobName.length() > 0, telemetryMask(status),
+                              shown.filamentCount > 0);
     drawMainScreen(shown, withThumb, retrying);
 
     bool full = layout != prevLayout ||
@@ -1502,7 +1626,8 @@ void loop() {
             String((int)status.rightNozzleTemp) + "|" +
             String((int)status.amsTemp) + "|" +
             String(status.amsHumidity) + "|" +
-            String(status.amsHumidityRaw) + "|thumb=" +
+            String(status.amsHumidityRaw) + "|mat=" +
+            filamentKey + materialsSig(status) + "|thumb=" +
             String(thumbnailReady ? 1 : 0) + "|fail=" +
             String((thumbnailAttempts > 0 && !thumbnailReady) ? 1 : 0);
 
